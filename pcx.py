@@ -3,6 +3,7 @@ import re
 import json
 import time
 import subprocess
+import random
 from datetime import datetime
 from typing import Dict, List, Any, Optional
 
@@ -158,6 +159,7 @@ class BookMyShowScraper:
     def __init__(self):
         self.use_warp = False 
         self.state_manager = GitStateManager(Config.STATE_FILE)
+        self.session = cffi_requests.Session(impersonate="chrome")
 
     def toggle_warp(self) -> None:
         if self.use_warp:
@@ -174,16 +176,22 @@ class BookMyShowScraper:
         for attempt in range(1, max_retries + 1):
             proxies = Config.PROXIES if self.use_warp else None
             try:
-                func = cffi_requests.get if method.upper() == 'GET' else cffi_requests.post
-                resp = func(url, proxies=proxies, impersonate="chrome", timeout=15, **kwargs)
+                # [FIX]: Use the persistent session instead of a brand new request
+                func = self.session.get if method.upper() == 'GET' else self.session.post
+                resp = func(url, proxies=proxies, timeout=15, **kwargs)
                 
                 print(f"    -> Status: {resp.status_code} (Using WARP: {self.use_warp})")
                 
-                # FIXED: Now handles both Rate Limits (429) AND Security Blocks (403)
                 if resp.status_code in [403, 429]:
                     print(f"    -> ⚠️ Blocked/Rate limited ({resp.status_code}) on attempt {attempt}/{max_retries}.")
                     if attempt < max_retries:
-                        self.toggle_warp()
+                        # [FIX]: Only flip IP on a hard 403 block. On 429, just wait!
+                        if resp.status_code == 403:
+                            self.toggle_warp()
+                        else:
+                            print("    -> ⏳ Rate limited (429). Sleeping 10 seconds before retry...")
+                            time.sleep(10)
+                            
                         print("    -> Retrying request...")
                         continue
                     print("    -> ❌ Max retries reached.")
@@ -193,20 +201,19 @@ class BookMyShowScraper:
                 error_msg = str(e).split('first for more details.')[0].strip()
                 print(f"    -> ⚠️ Network exception on attempt {attempt}: {error_msg}")
                 if attempt < max_retries:
-                    # FIXED: Turn WARP ON if standard IP is blackholed, or OFF if proxy dies
-                    if not self.use_warp:
-                        print("    -> 🚨 Runner IP blackholed! Turning WARP ON to escape...")
-                        self.toggle_warp()
-                    else:
-                        print("    -> 🚨 Proxy dead! Forcing WARP OFF to recover...")
-                        self.toggle_warp()
-                    print("    -> Retrying request...")
+                    # [FIX]: Don't aggressively drop WARP on standard timeouts. Just wait.
+                    print("    -> Sleeping for 5 seconds before retrying...")
+                    time.sleep(5)
                     continue
         return None
 
     def fetch_sessions(self) -> List[Dict[str, str]]:
         sessions = []
         for date_code in Config.DATES:
+            # [FIX]: Add human jitter before polling the heavily guarded main API
+            wait_time = random.uniform(5.5, 2.5)
+            time.sleep(wait_time)
+            
             url = f"https://in.bookmyshow.com/api/movies-data/seatlayout/v1/primary?eventCode={Config.EVENT_CODE}&dateCode={date_code}&regionCode=HYD&venueCode={Config.VENUE_CODE}"
             resp = self.make_request('GET', url, headers=Config.GET_HEADERS)
             if not resp or resp.status_code != 200:
@@ -231,7 +238,6 @@ class BookMyShowScraper:
                     })
                     
             except Exception as e:
-                # FIXED: Silences the "Expecting value" error when movies aren't listed yet
                 if "Expecting value" not in str(e):
                     print(f"    -> JSON Parse error for {date_code}: {e}")
                 
@@ -265,7 +271,6 @@ class BookMyShowScraper:
             elements = row.split(":")
             row_letter = elements[1]
             
-            # FIXED: Capture group (\d+) moved to the end to grab the REAL seat number!
             seats = [m.group(1) for s in elements[2:] if (m := re.search(r"[A-Z]1\d+\+(\d+)", s))]
             
             if seats:
@@ -289,6 +294,10 @@ class BookMyShowScraper:
             print("[STATE] No previous state found. Monitoring for advance booking drop...")
 
         cycle_count = 1
+        
+        # [FIX]: Initialize outside the loop so we don't clear it every cycle
+        target_sessions = [] 
+
         while (time.time() - start_time) < Config.MAX_RUNTIME_SECONDS:
             print(f"\n{'='*50}\n🔄 POLLING CYCLE {cycle_count}\n{'='*50}")
             
@@ -298,24 +307,31 @@ class BookMyShowScraper:
             # ---------------------------------------------------------
             # PHASE 1: WAITING FOR SHOWS TO BE LISTED
             # ---------------------------------------------------------
-            target_sessions = self.fetch_sessions()
+            # [FIX]: Only fetch sessions if the list is empty
+            if not target_sessions:
+                target_sessions = self.fetch_sessions()
+                total_sessions = len(target_sessions)
+                
+                if total_sessions == 0:
+                    # [FIX]: Throttle heavily. Wait 2 to 2.5 minutes between checks to avoid 403s
+                    wait_time = random.uniform(120.0, 160.0)
+                    print(f"    -> 🔴 Not listed yet. Sleeping for {wait_time:.1f}s before checking again...")
+                    time.sleep(wait_time) 
+                    cycle_count += 1
+                    continue 
+                    
+                if not shows_are_live:
+                    print(f"\n    -> 🟢🚨 ADVANCE BOOKINGS JUST OPENED! Found {total_sessions} shows matching filters!")
+                    shows_are_live = True
+                    
+                    booking_url = f"https://in.bookmyshow.com/buytickets/{Config.EVENT_CODE}-hyderabad/movie-hyd-{Config.VENUE_CODE}-MT/"
+                    msg = (f"🚨 ADVANCE BOOKING OPEN! 🚨\n\n"f"The movie is now live at {Config.VENUE_CODE}!\n"f"{total_sessions} valid shows have been added.\n\n"f"Book IMMEDIATELY:\n{booking_url}")
+                    Utils.trigger_ntfy(msg, booking_url, priority="max")
+                    
+                    time.sleep(10) 
+
+            # Keep total_sessions updated for logging
             total_sessions = len(target_sessions)
-            
-            if total_sessions == 0:
-                print(f"    -> 🔴 Not listed yet. Sleeping for 30 seconds before checking again...")
-                time.sleep(30) 
-                cycle_count += 1
-                continue 
-                
-            if not shows_are_live:
-                print(f"\n    -> 🟢🚨 ADVANCE BOOKINGS JUST OPENED! Found {total_sessions} shows matching filters!")
-                shows_are_live = True
-                
-                booking_url = f"https://in.bookmyshow.com/buytickets/{Config.EVENT_CODE}-hyderabad/movie-hyd-{Config.VENUE_CODE}-MT/"
-                msg = (f"🚨 ADVANCE BOOKING OPEN! 🚨\n\n"f"The movie is now live at {Config.VENUE_CODE}!\n"f"{total_sessions} valid shows have been added.\n\n"f"Book IMMEDIATELY:\n{booking_url}")
-                Utils.trigger_ntfy(msg, booking_url, priority="max")
-                
-                time.sleep(10) 
 
             # ---------------------------------------------------------
             # PHASE 2: STANDARD SEAT TRACKING 
@@ -323,10 +339,13 @@ class BookMyShowScraper:
             for index, session in enumerate(target_sessions, 1):
                 s_id, s_date, s_time = session["sessionId"], session["dateCode"], session["time"]
                 
-                print(f"\n[{index}/{total_sessions}] Checking Session {s_id} ({s_date} @ {s_time})\n    -> Sleeping for 30s...")
-                time.sleep(30)
+                print(f"\n[{index}/{total_sessions}] Checking Session {s_id} ({s_date} @ {s_time})")
                 
-                # FIXED: The Emergency Brake to prevent GitHub limits from crashing the script
+                # [FIX]: Randomize sleep time to prevent WAF bot-pattern detection
+                seat_wait = random.uniform(25.0, 35.0)
+                print(f"    -> Sleeping for {seat_wait:.1f}s...")
+                time.sleep(seat_wait)
+                
                 if (time.time() - start_time) > Config.MAX_RUNTIME_SECONDS:
                     print("    -> ⏳ Mid-cycle time limit reached! Breaking out to ensure safe shutdown.")
                     break
