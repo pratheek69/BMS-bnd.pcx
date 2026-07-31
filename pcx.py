@@ -211,7 +211,7 @@ class BookMyShowScraper:
         sessions = []
         for date_code in Config.DATES:
             # [FIX]: Add human jitter before polling the heavily guarded main API
-            wait_time = random.uniform(5.5, 2.5)
+            wait_time = random.uniform(5.5, 6.5)
             time.sleep(wait_time)
             
             url = f"https://in.bookmyshow.com/api/movies-data/seatlayout/v1/primary?eventCode={Config.EVENT_CODE}&dateCode={date_code}&regionCode=HYD&venueCode={Config.VENUE_CODE}"
@@ -342,7 +342,7 @@ class BookMyShowScraper:
                 print(f"\n[{index}/{total_sessions}] Checking Session {s_id} ({s_date} @ {s_time})")
                 
                 # [FIX]: Randomize sleep time to prevent WAF bot-pattern detection
-                seat_wait = random.uniform(25.0, 35.0)
+                seat_wait = random.uniform(20.0, 25.0)
                 print(f"    -> Sleeping for {seat_wait:.1f}s...")
                 time.sleep(seat_wait)
                 
